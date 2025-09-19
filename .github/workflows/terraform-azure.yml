@@ -26,7 +26,7 @@ jobs:
       BACKEND_RG: tfstate-shared-rg
       BACKEND_SA: sttfstateshared
       BACKEND_CONTAINER: tfstate
-      BACKEND_KEY: web-server-vm.tfstate
+      BACKEND_KEY: "web-tfstate/web-server-vm.tfstate"
       # TF directory - change if your terraform code lives elsewhere
       TF_DIR: .
       SECRETS_TFVAR: secrets.tfvars
