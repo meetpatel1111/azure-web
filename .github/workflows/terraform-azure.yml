@@ -1,8 +1,8 @@
 name: Terraform - Azure deploy
 
 on:
-  # push:
-  #   branches: [ main ]
+  push:
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
@@ -25,21 +25,28 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Create terraform.tfvars from secrets
+      - name: Create terraform.auto.tfvars (safe)
+        # use printf to avoid heredoc + indentation issues with newlines in the secret
         run: |
-          cat > terraform.auto.tfvars <<EOF
-          admin_ssh_public_key = "${{ secrets.ADMIN_SSH_PUB }}"
-          resource_group_name = "web-server-rg"
-          location = "eastus"
-          EOF
+          printf '%s\n' "resource_group_name = \"web-server-rg\"" > terraform.auto.tfvars
+          printf '%s\n' "location = \"eastus\"" >> terraform.auto.tfvars
+          # write admin_ssh_public_key as a single-line string value (escaped as needed)
+          printf 'admin_ssh_public_key = "%s"\n' "${{ secrets.ADMIN_SSH_PUB }}" >> terraform.auto.tfvars
+        shell: bash
 
-      - name: Terraform Init
-        run: terraform init -input=false
+      - name: Show directory (for debug)
+        run: ls -la
 
-      - name: Terraform Validate & Format
+      - name: Terraform Format (auto-fix)
+        run: terraform fmt -write
+
+      - name: Terraform Validate & Format check
         run: |
           terraform fmt -check
           terraform validate
+
+      - name: Terraform Init
+        run: terraform init -input=false
 
       - name: Terraform Plan
         run: terraform plan -out=tfplan -input=false
