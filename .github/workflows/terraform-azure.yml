@@ -29,6 +29,8 @@ jobs:
       BACKEND_KEY: web-server-vm.tfstate
       # TF directory - change if your terraform code lives elsewhere
       TF_DIR: .
+      SECRETS_TFVAR: secrets.tfvars
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -77,20 +79,23 @@ jobs:
             --account-name "${BACKEND_SA}" \
             --auth-mode login || true
 
-      - name: Create terraform.auto.tfvars (safe)
+      - name: Create secrets.tfvars (safe - contains only sensitive vars)
         shell: bash
         run: |
+          # Do NOT create terraform.auto.tfvars — create an explicit var-file instead
           if [ -z "${{ secrets.ADMIN_SSH_PUB }}" ]; then
             echo "ERROR: ADMIN_SSH_PUB secret is missing or empty. Create repo secret ADMIN_SSH_PUB containing your SSH public key (ssh-rsa ...)." >&2
             exit 1
           fi
 
-          cat > terraform.auto.tfvars <<EOF
-resource_group_name = "web-server-rg"
-location = "eastus"
-admin_ssh_public_key = "${{ secrets.ADMIN_SSH_PUB }}"
-EOF
-          echo "Wrote terraform.auto.tfvars (bytes: $(wc -c < terraform.auto.tfvars))"
+          # Write the secrets file using echo (safe for GitHub Actions interpolation)
+          # Put quotes around the public key so it's valid HCL string.
+          echo "admin_ssh_public_key = \"${{ secrets.ADMIN_SSH_PUB }}\"" > "${SECRETS_TFVAR}"
+
+          # Add additional sensitive variables here if needed, using the same pattern:
+          # echo 'some_secret = "value"' >> "${SECRETS_TFVAR}"
+
+          echo "Wrote ${SECRETS_TFVAR} (bytes: $(wc -c < ${SECRETS_TFVAR}))"
 
       - name: Terraform Init (try auth_mode=login)
         shell: bash
@@ -108,7 +113,6 @@ EOF
             echo "Init succeeded with auth_mode=login"
           else
             echo "Init with auth_mode=login failed — will attempt to fetch storage key and init with access_key"
-            # fetch storage key and retry
             KEY=$(az storage account keys list --resource-group "${BACKEND_RG}" --account-name "${BACKEND_SA}" --query '[0].value' -o tsv) || {
               echo "Failed to fetch storage account key"; exit 1;
             }
@@ -149,9 +153,14 @@ EOF
         shell: bash
         run: |
           cd "${TF_DIR}"
-          terraform validate
+          # run validate using var-file so validations referencing variables succeed
+          VF="../${SECRETS_TFVAR}"
+          if [ ! -f "${VF}" ]; then
+            VF="${SECRETS_TFVAR}"
+          fi
+          terraform validate -var-file="${VF}" || terraform validate
 
-      - name: Terraform Run (plan/apply/destroy/refresh)
+      - name: Terraform Run (plan/apply/destroy/refresh) using secrets.tfvars
         shell: bash
         env:
           ACTION: ${{ github.event.inputs.action }}
@@ -161,10 +170,16 @@ EOF
           cd "${TF_DIR}"
           echo "Requested action: ${ACTION}"
 
+          # determine var-file path (workflow writes secrets.tfvars into repo root)
+          VF="../${SECRETS_TFVAR}"
+          if [ ! -f "${VF}" ]; then
+            VF="${SECRETS_TFVAR}"
+          fi
+
           case "${ACTION}" in
             plan)
-              echo "Running terraform plan..."
-              terraform plan -out=tfplan -input=false
+              echo "Running terraform plan with var-file ${VF}..."
+              terraform plan -out=tfplan -input=false -var-file="${VF}"
               echo "Plan saved to tfplan"
               ;;
             apply)
@@ -172,18 +187,18 @@ EOF
                 echo "ERROR: apply is only allowed from 'main' branch. Current ref: ${GITHUB_REF}" >&2
                 exit 1
               fi
-              echo "Running terraform plan then apply..."
-              terraform plan -out=tfplan -input=false
+              echo "Running terraform plan then apply using var-file ${VF}..."
+              terraform plan -out=tfplan -input=false -var-file="${VF}"
               terraform apply -input=false -auto-approve tfplan
               ;;
             destroy)
-              echo "Running terraform plan -destroy and apply to destroy resources..."
-              terraform plan -destroy -out=tfplan-destroy -input=false
+              echo "Running terraform plan -destroy (var-file ${VF}) and apply to destroy resources..."
+              terraform plan -destroy -out=tfplan-destroy -input=false -var-file="${VF}"
               terraform apply -input=false tfplan-destroy
               ;;
             refresh)
-              echo "Running terraform refresh..."
-              terraform refresh -input=false
+              echo "Running terraform refresh (var-file ${VF})..."
+              terraform refresh -input=false -var-file="${VF}"
               ;;
             *)
               echo "Unknown action: ${ACTION}" >&2
