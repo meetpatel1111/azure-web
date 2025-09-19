@@ -65,11 +65,14 @@
                 exit 1
               fi
 
-              printf '%s' "resource_group_name = "web-server-rg"" > terraform.auto.tfvars
-              printf '%s' "location = "eastus"" >> terraform.auto.tfvars
-              printf 'admin_ssh_public_key = "%s"' "${{ secrets.ADMIN_SSH_PUB }}" >> terraform.auto.tfvars
+              cat > terraform.auto.tfvars <<EOF
+              resource_group_name = "web-server-rg"
+              location = "eastus"
+              admin_ssh_public_key = "${{ secrets.ADMIN_SSH_PUB }}"
+              EOF
 
-              echo "Wrote terraform.auto.tfvars (admin_ssh_public_key length: $(echo -n "${{ secrets.ADMIN_SSH_PUB }}" | wc -c))"
+              # show small confirmation (do NOT print the secret)
+              echo "Wrote terraform.auto.tfvars (bytes: $(wc -c < terraform.auto.tfvars))"
 
           - name: Terraform Init (with backend)
             env:
