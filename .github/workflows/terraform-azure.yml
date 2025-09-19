@@ -22,7 +22,13 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TF_IN_AUTOMATION: "true"
-
+      # Backend constants (shared)
+      BACKEND_RG: tfstate-shared-rg
+      BACKEND_SA: sttfstateshared
+      BACKEND_CONTAINER: tfstate
+      BACKEND_KEY: web-server-vm.tfstate
+      # TF directory - change if your terraform code lives elsewhere
+      TF_DIR: .
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -38,48 +44,38 @@ jobs:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
       - name: Export ARM_* env vars from AZURE_CREDENTIALS
+        shell: bash
         run: |
-          echo "Parsing AZURE_CREDENTIALS and exporting ARM_* env vars"
+          echo "Exporting ARM_* from AZURE_CREDENTIALS"
           echo "ARM_SUBSCRIPTION_ID=$(echo '${{ secrets.AZURE_CREDENTIALS }}' | jq -r .subscriptionId)" >> $GITHUB_ENV
           echo "ARM_CLIENT_ID=$(echo '${{ secrets.AZURE_CREDENTIALS }}' | jq -r .clientId)" >> $GITHUB_ENV
           echo "ARM_CLIENT_SECRET=$(echo '${{ secrets.AZURE_CREDENTIALS }}' | jq -r .clientSecret)" >> $GITHUB_ENV
           echo "ARM_TENANT_ID=$(echo '${{ secrets.AZURE_CREDENTIALS }}' | jq -r .tenantId)" >> $GITHUB_ENV
-        shell: bash
 
-      - name: Ensure TFState resource group exists
+      - name: Ensure TFState resource group exists (idempotent)
+        shell: bash
         run: |
-          az group create --name tfstate-shared-rg --location eastus
-        shell: bash
+          az group create --name "${BACKEND_RG}" --location eastus --output none
 
-      - name: Ensure Storage Account exists for remote state
+      - name: Ensure Storage Account exists for remote state (idempotent)
+        shell: bash
         run: |
           az storage account create \
-            --name sttfstateshared \
-            --resource-group tfstate-shared-rg \
+            --name "${BACKEND_SA}" \
+            --resource-group "${BACKEND_RG}" \
             --location eastus \
             --sku Standard_LRS \
             --kind StorageV2 \
             --enable-hierarchical-namespace false \
             --https-only true || true
-        shell: bash
 
-      - name: Ensure blob container exists
+      - name: Ensure blob container exists (idempotent)
+        shell: bash
         run: |
           az storage container create \
-            --name tfstate \
-            --account-name sttfstateshared \
+            --name "${BACKEND_CONTAINER}" \
+            --account-name "${BACKEND_SA}" \
             --auth-mode login || true
-        shell: bash
-
-      - name: Get storage account key
-        id: getkey
-        run: |
-          key=$(az storage account keys list \
-            --resource-group tfstate-shared-rg \
-            --account-name sttfstateshared \
-            --query '[0].value' -o tsv)
-          echo "STORAGE_KEY=${key}" >> $GITHUB_ENV
-        shell: bash
 
       - name: Create terraform.auto.tfvars (safe)
         shell: bash
@@ -90,38 +86,79 @@ jobs:
           fi
 
           cat > terraform.auto.tfvars <<EOF
-          resource_group_name = "web-server-rg"
-          location = "eastus"
-          admin_ssh_public_key = "${{ secrets.ADMIN_SSH_PUB }}"
-          EOF
-
+resource_group_name = "web-server-rg"
+location = "eastus"
+admin_ssh_public_key = "${{ secrets.ADMIN_SSH_PUB }}"
+EOF
           echo "Wrote terraform.auto.tfvars (bytes: $(wc -c < terraform.auto.tfvars))"
 
-      - name: Terraform Init (with backend)
-        env:
-          STORAGE_KEY: ${{ env.STORAGE_KEY }}
-        run: |
-          terraform init \
-            -backend-config="storage_account_name=sttfstateshared" \
-            -backend-config="container_name=tfstate" \
-            -backend-config="key=web-server-vm.tfstate" \
-            -backend-config="access_key=${STORAGE_KEY}"
+      - name: Terraform Init (try auth_mode=login)
         shell: bash
+        run: |
+          set -euo pipefail
+          cd "${TF_DIR}"
+          echo "Attempting 'terraform init' with auth_mode=login..."
+          if terraform init -input=false -reconfigure \
+              -backend-config="resource_group_name=${BACKEND_RG}" \
+              -backend-config="storage_account_name=${BACKEND_SA}" \
+              -backend-config="container_name=${BACKEND_CONTAINER}" \
+              -backend-config="key=${BACKEND_KEY}" \
+              -backend-config="auth_mode=login"
+          then
+            echo "Init succeeded with auth_mode=login"
+          else
+            echo "Init with auth_mode=login failed — will attempt to fetch storage key and init with access_key"
+            # fetch storage key and retry
+            KEY=$(az storage account keys list --resource-group "${BACKEND_RG}" --account-name "${BACKEND_SA}" --query '[0].value' -o tsv) || {
+              echo "Failed to fetch storage account key"; exit 1;
+            }
+            echo "Retrying terraform init with access_key (masked)..."
+            terraform init -input=false -reconfigure \
+              -backend-config="resource_group_name=${BACKEND_RG}" \
+              -backend-config="storage_account_name=${BACKEND_SA}" \
+              -backend-config="container_name=${BACKEND_CONTAINER}" \
+              -backend-config="key=${BACKEND_KEY}" \
+              -backend-config="access_key=${KEY}"
+          fi
+
+      - name: Verify backend & list blobs (debug)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${TF_DIR}"
+          echo "Reconfigure backend (debug) to show status"
+          terraform init -reconfigure \
+            -backend-config="resource_group_name=${BACKEND_RG}" \
+            -backend-config="storage_account_name=${BACKEND_SA}" \
+            -backend-config="container_name=${BACKEND_CONTAINER}" \
+            -backend-config="key=${BACKEND_KEY}" \
+            -backend-config="auth_mode=login" || true
+
+          echo ""
+          echo "Checking container existence and listing blobs (auth-mode=login)"
+          az storage container exists --account-name "${BACKEND_SA}" --name "${BACKEND_CONTAINER}" --auth-mode login -o json || true
+          az storage blob list --account-name "${BACKEND_SA}" --container-name "${BACKEND_CONTAINER}" --auth-mode login --output table || true
 
       - name: Terraform Format (auto-fix)
-        run: terraform fmt -write
         shell: bash
+        run: |
+          cd "${TF_DIR}"
+          terraform fmt -write
 
       - name: Terraform Validate
-        run: terraform validate
         shell: bash
+        run: |
+          cd "${TF_DIR}"
+          terraform validate
 
       - name: Terraform Run (plan/apply/destroy/refresh)
+        shell: bash
         env:
           ACTION: ${{ github.event.inputs.action }}
           GITHUB_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
+          cd "${TF_DIR}"
           echo "Requested action: ${ACTION}"
 
           case "${ACTION}" in
@@ -131,28 +168,43 @@ jobs:
               echo "Plan saved to tfplan"
               ;;
             apply)
-              # safety: allow apply only from main branch runner
               if [ "${GITHUB_REF:-refs/heads/unknown}" != "refs/heads/main" ]; then
                 echo "ERROR: apply is only allowed from 'main' branch. Current ref: ${GITHUB_REF}" >&2
                 exit 1
               fi
-              echo "Running terraform plan (to produce tfplan) then apply..."
+              echo "Running terraform plan then apply..."
               terraform plan -out=tfplan -input=false
               terraform apply -input=false -auto-approve tfplan
               ;;
             destroy)
-              # destruction is explicit — require confirmation by input variable but still allow run
-              echo "Running terraform plan -destroy and applying to destroy resources..."
-              terraform plan -destroy -out=tfplan -input=false
-              terraform apply -input=false tfplan
+              echo "Running terraform plan -destroy and apply to destroy resources..."
+              terraform plan -destroy -out=tfplan-destroy -input=false
+              terraform apply -input=false tfplan-destroy
               ;;
             refresh)
               echo "Running terraform refresh..."
               terraform refresh -input=false
               ;;
             *)
-              echo "Unknown action '${ACTION}'. Supported: plan, apply, destroy, refresh" >&2
+              echo "Unknown action: ${ACTION}" >&2
               exit 1
               ;;
           esac
+
+      - name: List backend blobs after run (verify tfstate)
         shell: bash
+        run: |
+          echo "Listing blobs in tfstate container (auth-mode=login preferred):"
+          az storage blob list --account-name "${BACKEND_SA}" --container-name "${BACKEND_CONTAINER}" --auth-mode login --output table || echo "failed to list blobs with auth-mode=login"
+
+      - name: Attempt terraform state pull (if remote state exists)
+        shell: bash
+        run: |
+          cd "${TF_DIR}"
+          if terraform state pull > /tmp/remote_state.json 2>/dev/null; then
+            echo "Pulled remote state (first 200 chars):"
+            head -c 200 /tmp/remote_state.json || true
+            echo ""
+          else
+            echo "No remote state found or unable to pull."
+          fi
