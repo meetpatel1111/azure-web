@@ -21,9 +21,14 @@ variable "admin_username" {
 }
 
 variable "admin_ssh_public_key" {
-  description = "SSH public key (ssh-rsa AAAA... )"
+  description = "SSH public key (ssh-rsa AAAA... ) - set via terraform.auto.tfvars or CI secret"
   type        = string
   sensitive   = true
+
+  validation {
+    condition     = length(trim(var.admin_ssh_public_key)) > 0
+    error_message = "admin_ssh_public_key must be provided and not empty. Set it via terraform.auto.tfvars or CI secret ADMIN_SSH_PUB."
+  }
 }
 
 variable "vm_size" {
