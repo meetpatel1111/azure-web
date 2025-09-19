@@ -1,0 +1,49 @@
+name: Terraform - Azure deploy
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      TF_IN_AUTOMATION: "true"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.6.5
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Create terraform.tfvars from secrets
+        run: |
+          cat > terraform.auto.tfvars <<EOF
+          admin_ssh_public_key = "${{ secrets.ADMIN_SSH_PUB }}"
+          resource_group_name = "web-server-rg"
+          location = "eastus"
+          EOF
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      - name: Terraform Validate & Format
+        run: |
+          terraform fmt -check
+          terraform validate
+
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan -input=false
+
+      - name: Terraform Apply
+        if: github.ref == 'refs/heads/main'
+        run: terraform apply -input=false -auto-approve tfplan
