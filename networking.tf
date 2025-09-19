@@ -2,8 +2,8 @@ resource "azurerm_public_ip" "pip" {
   name                = "${var.vm_name}-pip"
   location            = data.azurerm_resource_group.existing.location
   resource_group_name = data.azurerm_resource_group.existing.name
-  allocation_method   = "Dynamic"
-  sku                 = "Basic"
+  allocation_method   = "Static" # or "Dynamic" — Standard often uses Static
+  sku                 = "Standard"
 }
 
 resource "azurerm_virtual_network" "vnet" {
