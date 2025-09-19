@@ -26,7 +26,7 @@ variable "admin_ssh_public_key" {
   sensitive   = true
 
   validation {
-    condition     = length(trim(var.admin_ssh_public_key)) > 0
+    condition     = length(trimspace(var.admin_ssh_public_key)) > 0
     error_message = "admin_ssh_public_key must be provided and not empty. Set it via terraform.auto.tfvars or CI secret ADMIN_SSH_PUB."
   }
 }

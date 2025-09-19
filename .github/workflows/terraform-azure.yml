@@ -71,7 +71,6 @@
               admin_ssh_public_key = "${{ secrets.ADMIN_SSH_PUB }}"
               EOF
 
-              # show small confirmation (do NOT print the secret)
               echo "Wrote terraform.auto.tfvars (bytes: $(wc -c < terraform.auto.tfvars))"
 
           - name: Terraform Init (with backend)
