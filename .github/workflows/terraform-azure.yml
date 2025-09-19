@@ -1,98 +1,158 @@
-    name: Terraform - Azure deploy (with remote backend)
+name: Terraform - Azure deploy (with remote backend)
 
-    on:
-      workflow_dispatch:
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Terraform action to run'
+        required: true
+        default: 'plan'
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+          - refresh
 
-    permissions:
-      contents: read
+permissions:
+  contents: read
 
-    jobs:
-      deploy:
-        runs-on: ubuntu-latest
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      TF_IN_AUTOMATION: "true"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.6.5
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Export ARM_* env vars from AZURE_CREDENTIALS
+        run: |
+          echo "Parsing AZURE_CREDENTIALS and exporting ARM_* env vars"
+          echo "ARM_SUBSCRIPTION_ID=$(echo '${{ secrets.AZURE_CREDENTIALS }}' | jq -r .subscriptionId)" >> $GITHUB_ENV
+          echo "ARM_CLIENT_ID=$(echo '${{ secrets.AZURE_CREDENTIALS }}' | jq -r .clientId)" >> $GITHUB_ENV
+          echo "ARM_CLIENT_SECRET=$(echo '${{ secrets.AZURE_CREDENTIALS }}' | jq -r .clientSecret)" >> $GITHUB_ENV
+          echo "ARM_TENANT_ID=$(echo '${{ secrets.AZURE_CREDENTIALS }}' | jq -r .tenantId)" >> $GITHUB_ENV
+        shell: bash
+
+      - name: Ensure TFState resource group exists
+        run: |
+          az group create --name tfstate-shared-rg --location eastus
+        shell: bash
+
+      - name: Ensure Storage Account exists for remote state
+        run: |
+          az storage account create \
+            --name sttfstateshared \
+            --resource-group tfstate-shared-rg \
+            --location eastus \
+            --sku Standard_LRS \
+            --kind StorageV2 \
+            --enable-hierarchical-namespace false \
+            --https-only true || true
+        shell: bash
+
+      - name: Ensure blob container exists
+        run: |
+          az storage container create \
+            --name tfstate \
+            --account-name sttfstateshared \
+            --auth-mode login || true
+        shell: bash
+
+      - name: Get storage account key
+        id: getkey
+        run: |
+          key=$(az storage account keys list \
+            --resource-group tfstate-shared-rg \
+            --account-name sttfstateshared \
+            --query '[0].value' -o tsv)
+          echo "STORAGE_KEY=${key}" >> $GITHUB_ENV
+        shell: bash
+
+      - name: Create terraform.auto.tfvars (safe)
+        shell: bash
+        run: |
+          if [ -z "${{ secrets.ADMIN_SSH_PUB }}" ]; then
+            echo "ERROR: ADMIN_SSH_PUB secret is missing or empty. Create repo secret ADMIN_SSH_PUB containing your SSH public key (ssh-rsa ...)." >&2
+            exit 1
+          fi
+
+          cat > terraform.auto.tfvars <<EOF
+          resource_group_name = "web-server-rg"
+          location = "eastus"
+          admin_ssh_public_key = "${{ secrets.ADMIN_SSH_PUB }}"
+          EOF
+
+          echo "Wrote terraform.auto.tfvars (bytes: $(wc -c < terraform.auto.tfvars))"
+
+      - name: Terraform Init (with backend)
         env:
-          TF_IN_AUTOMATION: "true"
+          STORAGE_KEY: ${{ env.STORAGE_KEY }}
+        run: |
+          terraform init \
+            -backend-config="storage_account_name=sttfstateshared" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=web-server-vm.tfstate" \
+            -backend-config="access_key=${STORAGE_KEY}"
+        shell: bash
 
-        steps:
-          - name: Checkout
-            uses: actions/checkout@v4
+      - name: Terraform Format (auto-fix)
+        run: terraform fmt -write
+        shell: bash
 
-          - name: Setup Terraform
-            uses: hashicorp/setup-terraform@v2
-            with:
-              terraform_version: 1.6.5
+      - name: Terraform Validate
+        run: terraform validate
+        shell: bash
 
-          - name: Azure Login
-            uses: azure/login@v1
-            with:
-              creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Terraform Run (plan/apply/destroy/refresh)
+        env:
+          ACTION: ${{ github.event.inputs.action }}
+          GITHUB_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          echo "Requested action: ${ACTION}"
 
-          - name: Export ARM_* env vars from AZURE_CREDENTIALS
-            run: |
-              echo "Parsing AZURE_CREDENTIALS and exporting ARM_* env vars"
-              echo "ARM_SUBSCRIPTION_ID=$(echo '${{ secrets.AZURE_CREDENTIALS }}' | jq -r .subscriptionId)" >> $GITHUB_ENV
-              echo "ARM_CLIENT_ID=$(echo '${{ secrets.AZURE_CREDENTIALS }}' | jq -r .clientId)" >> $GITHUB_ENV
-              echo "ARM_CLIENT_SECRET=$(echo '${{ secrets.AZURE_CREDENTIALS }}' | jq -r .clientSecret)" >> $GITHUB_ENV
-              echo "ARM_TENANT_ID=$(echo '${{ secrets.AZURE_CREDENTIALS }}' | jq -r .tenantId)" >> $GITHUB_ENV
-            shell: bash
-
-          - name: Ensure TFState resource group exists
-            run: |
-              az group create --name tfstate-shared-rg --location eastus
-            shell: bash
-
-          - name: Ensure Storage Account exists for remote state
-            run: |
-              az storage account create                 --name sttfstateshared                 --resource-group tfstate-shared-rg                 --location eastus                 --sku Standard_LRS                 --kind StorageV2                 --enable-hierarchical-namespace false                 --https-only true || true
-            shell: bash
-
-          - name: Ensure blob container exists
-            run: |
-              az storage container create                 --name tfstate                 --account-name sttfstateshared                 --auth-mode login || true
-            shell: bash
-
-          - name: Get storage account key
-            id: getkey
-            run: |
-              key=$(az storage account keys list                 --resource-group tfstate-shared-rg                 --account-name sttfstateshared                 --query '[0].value' -o tsv)
-              echo "STORAGE_KEY=${key}" >> $GITHUB_ENV
-            shell: bash
-
-          - name: Create terraform.auto.tfvars (safe)
-            shell: bash
-            run: |
-              if [ -z "${{ secrets.ADMIN_SSH_PUB }}" ]; then
-                echo "ERROR: ADMIN_SSH_PUB secret is missing or empty. Create repo secret ADMIN_SSH_PUB containing your SSH public key (ssh-rsa ...)." >&2
+          case "${ACTION}" in
+            plan)
+              echo "Running terraform plan..."
+              terraform plan -out=tfplan -input=false
+              echo "Plan saved to tfplan"
+              ;;
+            apply)
+              # safety: allow apply only from main branch runner
+              if [ "${GITHUB_REF:-refs/heads/unknown}" != "refs/heads/main" ]; then
+                echo "ERROR: apply is only allowed from 'main' branch. Current ref: ${GITHUB_REF}" >&2
                 exit 1
               fi
-
-              cat > terraform.auto.tfvars <<EOF
-              resource_group_name = "web-server-rg"
-              location = "eastus"
-              admin_ssh_public_key = "${{ secrets.ADMIN_SSH_PUB }}"
-              EOF
-
-              echo "Wrote terraform.auto.tfvars (bytes: $(wc -c < terraform.auto.tfvars))"
-
-          - name: Terraform Init (with backend)
-            env:
-              STORAGE_KEY: ${{ env.STORAGE_KEY }}
-            run: |
-              terraform init                 -backend-config="storage_account_name=sttfstateshared"                 -backend-config="container_name=tfstate"                 -backend-config="key=web-server-vm.tfstate"                 -backend-config="access_key=${STORAGE_KEY}"
-            shell: bash
-
-          - name: Terraform Format (auto-fix)
-            run: terraform fmt -write
-            shell: bash
-
-          - name: Terraform Validate
-            run: terraform validate
-            shell: bash
-
-          - name: Terraform Plan
-            run: terraform plan -out=tfplan -input=false
-            shell: bash
-
-          - name: Terraform Apply
-            if: github.ref == 'refs/heads/main'
-            run: terraform apply -input=false -auto-approve tfplan
-            shell: bash
+              echo "Running terraform plan (to produce tfplan) then apply..."
+              terraform plan -out=tfplan -input=false
+              terraform apply -input=false -auto-approve tfplan
+              ;;
+            destroy)
+              # destruction is explicit — require confirmation by input variable but still allow run
+              echo "Running terraform plan -destroy and applying to destroy resources..."
+              terraform plan -destroy -out=tfplan -input=false
+              terraform apply -input=false tfplan
+              ;;
+            refresh)
+              echo "Running terraform refresh..."
+              terraform refresh -input=false
+              ;;
+            *)
+              echo "Unknown action '${ACTION}'. Supported: plan, apply, destroy, refresh" >&2
+              exit 1
+              ;;
+          esac
+        shell: bash
