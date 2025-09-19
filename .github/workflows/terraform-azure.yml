@@ -1,9 +1,12 @@
-name: Terraform - Azure deploy
+name: Terraform - Azure deploy (with remote backend)
 
 on:
-  push:
-    branches: [ main ]
+  # push:
+  #   branches: [ main ]
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   deploy:
@@ -25,28 +28,70 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
+      # create resource group for tfstate (idempotent)
+      - name: Ensure TFState resource group exists
+        run: |
+          az group create --name tfstate-shared-rg --location eastus
+        shell: bash
+
+      # create storage account (idempotent)
+      - name: Ensure Storage Account exists for remote state
+        run: |
+          az storage account create \
+            --name sttfstateshared \
+            --resource-group tfstate-shared-rg \
+            --location eastus \
+            --sku Standard_LRS \
+            --kind StorageV2 \
+            --enable-hierarchical-namespace false \
+            --https-only true || true
+        shell: bash
+
+      # create container for tfstate (idempotent)
+      - name: Ensure blob container exists
+        run: |
+          # attempt to create container using azure login (auth-mode login)
+          az storage container create \
+            --name tfstate \
+            --account-name sttfstateshared \
+            --auth-mode login || true
+        shell: bash
+
+      # get storage account key into env var for backend init
+      - name: Get storage account key
+        id: getkey
+        run: |
+          key=$(az storage account keys list \
+            --resource-group tfstate-shared-rg \
+            --account-name sttfstateshared \
+            --query '[0].value' -o tsv)
+          echo "STORAGE_KEY=${key}" >> $GITHUB_ENV
+        shell: bash
+
       - name: Create terraform.auto.tfvars (safe)
-        # use printf to avoid heredoc + indentation issues with newlines in the secret
         run: |
           printf '%s\n' "resource_group_name = \"web-server-rg\"" > terraform.auto.tfvars
           printf '%s\n' "location = \"eastus\"" >> terraform.auto.tfvars
-          # write admin_ssh_public_key as a single-line string value (escaped as needed)
           printf 'admin_ssh_public_key = "%s"\n' "${{ secrets.ADMIN_SSH_PUB }}" >> terraform.auto.tfvars
         shell: bash
 
-      - name: Show directory (for debug)
-        run: ls -la
+      # IMPORTANT: init with backend-config (this downloads provider plugins)
+      - name: Terraform Init (with backend)
+        run: |
+          terraform init \
+            -backend-config="storage_account_name=sttfstateshared" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=web-server-vm.tfstate" \
+            -backend-config="access_key=${STORAGE_KEY}"
+        env:
+          STORAGE_KEY: ${{ env.STORAGE_KEY }}
+        shell: bash
 
       - name: Terraform Format (auto-fix)
         run: terraform fmt -write
 
-      - name: Terraform Validate & Format check
-        run: |
-          terraform fmt -check
-          terraform validate
-
-      - name: Terraform Init
-        run: terraform init -input=false
+      - name: Terraform Validate
+        run: terraform validate
 
       - name: Terraform Plan
         run: terraform plan -out=tfplan -input=false
